@@ -43,8 +43,8 @@ Re-running only downloads filings you don't already have.
 
 ## Text copies for Claude / AnythingLLM
 
-`--text` writes a plain-text copy of every HTML document into the company's
-`Text for AI` folder. It strips the hidden inline-XBRL tagging, keeps each table
+`--text` writes a plain-text copy of each main document and press release (EX-99) into the company's
+`Text for AI` folder (other exhibits go in `Text for AI/Other exhibits`). It strips the hidden inline-XBRL tagging, keeps each table
 row on one line (`Net loss | $(293,153) | $7,125`), and starts each file with
 a header naming the company, form, filing date and SEC source URL.
 

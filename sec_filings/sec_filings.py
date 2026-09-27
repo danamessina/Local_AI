@@ -65,6 +65,10 @@ FORM_GROUPS = {
 }
 
 
+# R1.htm, R2.htm, ... are EDGAR's auto-generated XBRL viewer pages, duplicating the financials.
+XBRL_VIEWER_PAGE = re.compile(r"^R\d+\.html?$", re.I)
+
+
 def form_group(form):
     return FORM_GROUPS.get(form.removesuffix("/A"))
 
@@ -301,7 +305,8 @@ def download_company(edgar, query, out_root, since=None, until=None, all_docs=Fa
                 docs = [i["name"] for i in items
                         if re.search(r"\.(htm|html|pdf|txt|xlsx?|jpg|gif|png)$", i["name"], re.I)
                         and not re.search(r"-index(-headers)?\.html?$|^\d{10}-\d{2}-\d{6}\.txt$",
-                                          i["name"])]
+                                          i["name"])
+                        and not XBRL_VIEWER_PAGE.match(i["name"])]
             except urllib.error.HTTPError:
                 pass
         for doc in docs:
@@ -323,8 +328,12 @@ def download_company(edgar, query, out_root, since=None, until=None, all_docs=Fa
                 dest.write_bytes(data)
                 new += 1
                 print(f"  + {r['date']} {r['form']:<9} {doc}")
-            text_dest = text_dir / (dest.stem + ".txt")
-            if text and dest.suffix.lower() in (".htm", ".html") and not text_dest.exists():
+            # Main documents and press releases (EX-99) go straight into "Text for AI", ready
+            # to embed; contracts, certifications and other exhibits go in a subfolder.
+            is_key = doc == r["primary_doc"] or re.search(r"ex-?99", doc, re.I)
+            text_dest = (text_dir if is_key else text_dir / "Other exhibits") / (dest.stem + ".txt")
+            if (text and dest.suffix.lower() in (".htm", ".html") and not text_dest.exists()
+                    and not XBRL_VIEWER_PAGE.match(doc)):
                 try:
                     write_text_copy(dest, text_dest, name, r, f"{base}/{doc}")
                     converted += 1
