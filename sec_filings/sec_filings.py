@@ -10,6 +10,7 @@ Examples:
     python3 sec_filings.py "Atlas Air"           # by name search
     python3 sec_filings.py --comps western_global
     python3 sec_filings.py SNCY --since 2020-01-01 --all-docs
+    python3 sec_filings.py 1135185 --since 2019-01-01 --until 2020-10-20
     python3 sec_filings.py SNCY --dry-run        # list what would be downloaded
 
 Uses only the Python standard library. Re-running is safe: files already on
@@ -165,12 +166,14 @@ def safe(name):
     return re.sub(r'[\\/:*?"<>|]+', "_", name).strip(" .")
 
 
-def download_company(edgar, query, out_root, since=None, all_docs=False, dry_run=False, label=None):
+def download_company(edgar, query, out_root, since=None, until=None, all_docs=False, dry_run=False,
+                     label=None):
     cik, _ = edgar.resolve(query)
     name, tickers, rows = edgar.filings(cik)
     folder_name = safe(label or name) + (f" ({tickers[0]})" if tickers else "")
     company_dir = out_root / folder_name
-    wanted = [r for r in rows if form_group(r["form"]) and (not since or r["date"] >= since)]
+    wanted = [r for r in rows if form_group(r["form"])
+              and (not since or r["date"] >= since) and (not until or r["date"] <= until)]
     print(f"\n{name}  CIK {cik}  -> {company_dir}")
     print(f"  {len(wanted)} matching filings (of {len(rows)} total on EDGAR)")
 
@@ -232,6 +235,7 @@ def main():
     ap.add_argument("companies", nargs="*", help="ticker, CIK, or company name")
     ap.add_argument("--comps", metavar="SET", help="download every company in a set from comps.json")
     ap.add_argument("--since", default=cfg.get("since"), help="only filings on/after YYYY-MM-DD")
+    ap.add_argument("--until", default=cfg.get("until"), help="only filings on/before YYYY-MM-DD")
     ap.add_argument("--out", default=cfg["output_dir"], help="output folder (default from config.json)")
     ap.add_argument("--all-docs", action="store_true",
                     help="also download exhibits (e.g. 8-K press releases in EX-99.1)")
@@ -252,7 +256,8 @@ def main():
         sys.exit(f"Output folder's parent does not exist: {out_root.parent}")
     edgar = Edgar(cfg["user_agent"])
     for query, label in targets:
-        download_company(edgar, query, out_root, args.since, args.all_docs, args.dry_run, label)
+        download_company(edgar, query, out_root, args.since, args.until, args.all_docs, args.dry_run,
+                         label)
 
 
 if __name__ == "__main__":

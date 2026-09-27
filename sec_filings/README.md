@@ -32,7 +32,7 @@ python3 sec_filings.py SNCY                       # by ticker
 python3 sec_filings.py 1135185                    # by CIK (delisted companies)
 python3 sec_filings.py "Atlas Air"                # by name
 python3 sec_filings.py --comps western_global     # the whole comp set in comps.json
-python3 sec_filings.py SNCY --since 2019-01-01    # date cutoff
+python3 sec_filings.py SNCY --since 2019-01-01 --until 2020-10-20   # date range (inclusive)
 python3 sec_filings.py SNCY --all-docs            # include exhibits (8-K press releases etc.)
 python3 sec_filings.py SNCY --dry-run             # preview only
 ```
