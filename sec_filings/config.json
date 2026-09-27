@@ -1,0 +1,6 @@
+{
+  "_comment": "SEC requires every request to identify who is asking. Put your name and email in user_agent.",
+  "user_agent": "YOUR NAME your.email@example.com",
+  "output_dir": "/Users/danamessina/KM Server Dropbox/KM Server Team Folder/Consulting/DOL/2025/Western Global/SEC Filings",
+  "since": null
+}
