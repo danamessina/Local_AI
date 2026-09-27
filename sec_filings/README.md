@@ -12,6 +12,7 @@ SEC Filings/
     Proxy/       DEF 14A, DEFA14A, DEFM14A, PRE 14A, 14C
     Prospectus/  S-1, S-3, S-4, F-1, F-4, 424B*, FWP
     Tender Offer/ SC TO, SC 14D9, SC 13E3 (take-private deals)
+    Text for AI/  clean .txt copies (with --text), ready for Claude or AnythingLLM
     filings_index.csv
 ```
 
@@ -34,7 +35,18 @@ python3 sec_filings.py "Atlas Air"                # by name
 python3 sec_filings.py --comps western_global     # the whole comp set in comps.json
 python3 sec_filings.py SNCY --since 2019-01-01 --until 2020-10-20   # date range (inclusive)
 python3 sec_filings.py SNCY --all-docs            # include exhibits (8-K press releases etc.)
+python3 sec_filings.py SNCY --text                # also write clean .txt copies
 python3 sec_filings.py SNCY --dry-run             # preview only
 ```
 
 Re-running only downloads filings you don't already have.
+
+## Text copies for Claude / AnythingLLM
+
+`--text` writes a plain-text copy of every HTML document into the company's
+`Text for AI` folder. It strips the hidden inline-XBRL tagging, keeps each table
+row on one line (`Net loss | $(293,153) | $7,125`), and starts each file with
+a header naming the company, form, filing date and SEC source URL.
+
+Adding `--text` to a command you already ran converts the files already on
+disk without downloading them again. Originals are kept for citation.
