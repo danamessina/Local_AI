@@ -12,6 +12,7 @@ Examples:
     python3 sec_filings.py SNCY --since 2020-01-01 --all-docs
     python3 sec_filings.py 1135185 --since 2019-01-01 --until 2020-10-20
     python3 sec_filings.py SNCY --dry-run        # list what would be downloaded
+    python3 sec_filings.py SNCY --email you@firm.com   # instead of config.local.json
 
 Uses only the Python standard library. Re-running is safe: files already on
 disk are skipped, so a re-run only fetches new filings.
@@ -32,6 +33,15 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+
+# Used when config.json is absent, so the script also works as a single downloaded file.
+DEFAULT_CONFIG = {
+    "user_agent": "YOUR NAME your.email@example.com",
+    "output_dir": "/Users/danamessina/KM Server Dropbox/KM Server Team Folder/Consulting/DOL/2025/"
+                  "Western Global/SEC Filings",
+    "since": None,
+    "until": None,
+}
 
 # Form type -> folder name. Amendments ("/A") map to the same folder as the base form.
 FORM_GROUPS = {
@@ -60,8 +70,7 @@ def form_group(form):
 class Edgar:
     def __init__(self, user_agent):
         if not re.search(r"\S+@\S+\.\S+", user_agent) or "example.com" in user_agent:
-            sys.exit("SEC requires your name and email. Create sec_filings/config.local.json with\n"
-                     '  {"user_agent": "Jane Smith jane@firm.com"}')
+            sys.exit("SEC requires your email. Add it to the command, e.g.  --email jane@firm.com")
         self.user_agent = user_agent
         self._last = 0.0
 
@@ -225,7 +234,9 @@ def download_company(edgar, query, out_root, since=None, until=None, all_docs=Fa
 
 
 def main():
-    cfg = json.loads((HERE / "config.json").read_text())
+    cfg = dict(DEFAULT_CONFIG)
+    if (HERE / "config.json").exists():
+        cfg.update(json.loads((HERE / "config.json").read_text()))
     # Personal settings (e.g. user_agent email) go in config.local.json, which git ignores.
     local = HERE / "config.local.json"
     if local.exists():
@@ -239,6 +250,7 @@ def main():
     ap.add_argument("--out", default=cfg["output_dir"], help="output folder (default from config.json)")
     ap.add_argument("--all-docs", action="store_true",
                     help="also download exhibits (e.g. 8-K press releases in EX-99.1)")
+    ap.add_argument("--email", help="your email, sent to SEC to identify you (SEC requires it)")
     ap.add_argument("--dry-run", action="store_true", help="list filings without downloading")
     args = ap.parse_args()
 
@@ -254,7 +266,7 @@ def main():
     out_root = Path(args.out).expanduser()
     if not args.dry_run and not out_root.parent.exists():
         sys.exit(f"Output folder's parent does not exist: {out_root.parent}")
-    edgar = Edgar(cfg["user_agent"])
+    edgar = Edgar(f"SEC filings research {args.email}" if args.email else cfg["user_agent"])
     for query, label in targets:
         download_company(edgar, query, out_root, args.since, args.until, args.all_docs, args.dry_run,
                          label)
