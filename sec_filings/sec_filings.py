@@ -20,6 +20,7 @@ import argparse
 import csv
 import gzip
 import json
+import os
 import re
 import sys
 import time
@@ -58,8 +59,8 @@ def form_group(form):
 class Edgar:
     def __init__(self, user_agent):
         if not re.search(r"\S+@\S+\.\S+", user_agent) or "example.com" in user_agent:
-            sys.exit("Set user_agent in config.json to your name and email "
-                     "(SEC requires it), e.g. \"Jane Smith jane@firm.com\".")
+            sys.exit("SEC requires your name and email. Create sec_filings/config.local.json with\n"
+                     '  {"user_agent": "Jane Smith jane@firm.com"}')
         self.user_agent = user_agent
         self._last = 0.0
 
@@ -222,6 +223,11 @@ def download_company(edgar, query, out_root, since=None, all_docs=False, dry_run
 
 def main():
     cfg = json.loads((HERE / "config.json").read_text())
+    # Personal settings (e.g. user_agent email) go in config.local.json, which git ignores.
+    local = HERE / "config.local.json"
+    if local.exists():
+        cfg.update(json.loads(local.read_text()))
+    cfg["user_agent"] = os.environ.get("SEC_USER_AGENT", cfg["user_agent"])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("companies", nargs="*", help="ticker, CIK, or company name")
     ap.add_argument("--comps", metavar="SET", help="download every company in a set from comps.json")

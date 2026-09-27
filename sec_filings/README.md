@@ -20,8 +20,9 @@ Forms 3/4/5 (insider trades), 13D/13G and other filings are skipped.
 ## Setup (one time, on your Mac)
 
 1. Python 3.9+ (`python3 --version` in Terminal; macOS will offer to install it).
-2. Edit `config.json`: set `user_agent` to your name and email. SEC requires it
-   and blocks requests without it.
+2. Create `config.local.json` next to the script containing
+   `{"user_agent": "Your Name you@firm.com"}`. SEC requires it
+   and blocks requests without it. (This file is git-ignored so your email stays off GitHub.)
 
 ## Use
 
