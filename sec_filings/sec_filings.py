@@ -742,7 +742,9 @@ def update_index(out_dir, accession_rows):
     manifest_path = out_dir / ".index.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else []
     replaced = {r["accession"] for r in accession_rows}
-    manifest = [r for r in manifest if r["accession"] not in replaced] + accession_rows
+    # Files deleted by hand (e.g. in Finder) drop out of the index on the next run.
+    manifest = [r for r in manifest if r["accession"] not in replaced
+                and (out_dir / r["file"]).exists()] + accession_rows
     manifest.sort(key=lambda r: (r["ticker"], r["filed"], r["file"]))
     manifest_path.write_text(json.dumps(manifest, indent=1))
 
@@ -907,7 +909,8 @@ def prepare_output(args):
     out_dir.mkdir(exist_ok=True)
     manifest_path = out_dir / ".index.json"
     used_names = {Path(m["file"]).stem: m["accession"]
-                  for m in (json.loads(manifest_path.read_text()) if manifest_path.exists() else [])}
+                  for m in (json.loads(manifest_path.read_text()) if manifest_path.exists() else [])
+                  if (out_dir / m["file"]).exists()}
     return out_dir, used_names
 
 
