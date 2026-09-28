@@ -533,11 +533,25 @@ def resolve_filings(sub_rows, form, period, fye):
     return sorted(hits, key=lambda r: r["date"]), None
 
 
-def period_label(form, filing, fy_label):
+def fiscal_quarter(fye, report_date):
+    """(fiscal year, quarter) for a quarter ending on report_date, per the company's fiscal year."""
+    import datetime
+    rd = _date(report_date)
+    slack = datetime.timedelta(days=10)  # 52/53-week quarters end a few days off the month end
+    for fy in (rd.year, rd.year + 1):
+        start, end = fiscal_year_bounds(fye, fy)
+        if start - slack <= rd <= end + slack:
+            return fy, min(4, max(1, round(((rd - start).days + 1) / 91.3)))
+    return rd.year, 0
+
+
+def period_label(form, filing, fy_label, fye="1231"):
     if form == "10-K":
         return fy_label
     if form == "10-Q":
-        return filing["report_date"]
+        # Calendar-year filers: 2020Q2. Others carry the fiscal year: FDX's Aug-2020 quarter is FY2021Q1.
+        fy, q = fiscal_quarter(fye, filing["report_date"])
+        return f"{fy}Q{q}" if fye == "1231" else f"FY{fy}Q{q}"
     if form == "8-K":
         return filing["report_date"] or filing["date"]
     return filing["date"][:4]
@@ -596,17 +610,26 @@ def split_items(text, form):
     sections: list of (key, title, text); key "OtherItems" collects everything unmatched.
     """
     lines = text.split("\n")
-    part, cands = None, []
+    # 10-Q item numbers restart in Part II. Follow explicit PART headings when present; when an
+    # item number drops without one (e.g. Item 6 -> Item 1), switch parts anyway.
+    part, last_num, cands = None, None, []
     for i, line in enumerate(lines):
         plain = line.replace("|", " ").strip()
         mp = PART_HEADING.match(plain)
         if mp and len(plain) < 120:
-            part = mp.group(1).upper()
+            part, last_num = mp.group(1).upper(), None
             continue
         m = ITEM_HEADING.match(line)
         if not m or len(line) > 200:
             continue
         num = m.group(1).upper()
+        if form == "10-Q":
+            n = int(re.match(r"\d+", num).group())
+            if part is None:
+                part = "I"
+            elif last_num is not None and n < last_num:
+                part = "II" if part == "I" else "I"
+            last_num = n
         # "Item 7. MD&A", "ITEM 7 - MD&A", "Item 7" alone, "Item 7 Management's..." are headings;
         # "Item 1A of this report discusses ..." is a sentence.
         if not m.group(2) and m.group(3) and not m.group(3)[0].isupper():
@@ -741,11 +764,16 @@ def update_index(out_dir, accession_rows):
     return manifest
 
 
+class IntakeError(Exception):
+    """A fetched filing produced nothing usable. Always reported, never skipped silently."""
+
+
 def intake_one(edgar, cik, ticker, legal_name, form, filing, fy_label, out_dir, include_all, log,
-               used_names):
+               used_names, fye="1231"):
     acc_path = filing["accession"].replace("-", "")
     base = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_path}"
-    period = period_label(form, filing, fy_label)
+    period = period_label(form, filing, fy_label, fye)
+    who = f"{ticker} {form} {period} filed {filing['date']} (accession {filing['accession']})"
     phrase = period_phrase(form, filing, fy_label)
     available = filing["date"] <= VALUATION_DATE
     stem = f"FILINGS_{ticker}_{INTAKE_FORMS[form]}-{period}"
@@ -775,12 +803,16 @@ def intake_one(edgar, cik, ticker, legal_name, form, filing, fy_label, out_dir, 
             used_names[name] = filing["accession"]
             used_names.setdefault(("this", filing["accession"]), set()).add(name)
             text = strip_markers(html_to_text(edgar.get(f"{base}/{doc}")))
+            if not text.strip():
+                raise IntakeError(f"{who}: exhibit {doc} ({typ}) converted to empty text")
             cite = f"Exhibit {typ.replace('EX-', '')}" if typ != "8-K" else "Form 8-K"
             write_emitted(out_dir / f"{name}.txt", text, footer(tag, cite), emitted,
                           {**common, "part": tag})
         return emitted
 
     text = html_to_text(edgar.get(f"{base}/{filing['primary_doc']}"), table_markers=True)
+    if not strip_markers(text).strip():
+        raise IntakeError(f"{who}: {filing['primary_doc']} converted to empty text")
     if form == "DEF 14A":
         write_emitted(out_dir / f"{stem}_Full.txt", strip_markers(text),
                       footer("Full", "Definitive Proxy Statement"), emitted, {**common, "part": "Full"})
@@ -791,6 +823,8 @@ def intake_one(edgar, cik, ticker, legal_name, form, filing, fy_label, out_dir, 
     for line in item_map:
         log(line)
     keys = [k for k, _, _ in sections]
+    if keys == ["OtherItems"]:
+        raise IntakeError(f"{who}: zero items matched in {filing['primary_doc']}; nothing emitted")
     for req in REQUIRED_ITEMS[form]:
         if req not in keys:
             log(f"    WARNING: required {req} not detected; its text is in another item or OtherItems")
@@ -813,11 +847,115 @@ def intake_one(edgar, cik, ticker, legal_name, form, filing, fy_label, out_dir, 
     return emitted
 
 
-def intake_main(argv):
+def load_intake_config():
     cfg = dict(DEFAULT_CONFIG)
     for f in ("config.json", "config.local.json"):
         if (HERE / f).exists():
             cfg.update(json.loads((HERE / f).read_text()))
+    return cfg
+
+
+def add_common_intake_args(ap, cfg):
+    ap.add_argument("--email", help="contact email for the SEC User-Agent")
+    ap.add_argument("--yes", action="store_true", help="don't ask to confirm non-December fiscal years")
+    ap.add_argument("--dry-run", action="store_true", help="resolve and echo only; write nothing")
+    ap.add_argument("--refresh", action="store_true", help="re-pull filing lists instead of using raw/")
+    ap.add_argument("--out", default=cfg["intake_output_dir"],
+                    help="output folder (default: the Western Global/SEC Filings Dropbox folder)")
+    ap.add_argument("--raw", default=str(HERE / "raw"))
+
+
+def open_edgar(args, cfg):
+    ua = f"{cfg['contact_name']} {args.email}" if args.email else \
+        os.environ.get("SEC_USER_AGENT", cfg["user_agent"])
+    return CachedEdgar(ua, Path(args.raw).expanduser(), args.refresh)
+
+
+def open_company(edgar, ticker=None, cik=None):
+    if not cik:
+        cik = TICKER_ALIASES.get(ticker.upper()) or edgar.resolve(ticker)[0]
+    legal_name, tickers, rows = edgar.filings(cik)
+    fye = edgar.last_submission.get("fiscalYearEnd") or "1231"
+    ticker = (ticker or (tickers[0] if tickers else f"CIK{cik}")).upper()
+    print(f"\n{legal_name}  CIK {cik}  ticker {ticker}  fiscal year end {fye[:2]}-{fye[2:]}")
+    return {"cik": cik, "ticker": ticker, "legal_name": legal_name, "rows": rows, "fye": fye}
+
+
+def echo_plan(company, form, hits, fy_label):
+    for r in hits:
+        avail = "YES" if r["date"] <= VALUATION_DATE else "NO"
+        label = period_label(form, r, fy_label, company["fye"])
+        print(f"  {form:<8} {label:<11} period end {r['report_date'] or '-':<10}  filed {r['date']}  "
+              f"accession {r['accession']}  available at {VALUATION_DATE}: {avail}")
+
+
+def confirm_fiscal_year(companies, args):
+    odd = [c["ticker"] for c in companies if c["fye"] != "1231"]
+    if not odd or args.yes or args.dry_run:
+        return
+    if not sys.stdin.isatty():
+        sys.exit(f"Fiscal year does not end December 31 for {', '.join(odd)}; re-run with --yes.")
+    if input(f"Fiscal year does not end December 31 for {', '.join(odd)}. "
+             "Proceed with the filing(s) above? [y/N] ").strip().lower() != "y":
+        sys.exit("Stopped.")
+
+
+def prepare_output(args):
+    out_dir = Path(args.out).expanduser()
+    if not out_dir.parent.exists():
+        sys.exit(f"Output folder's parent does not exist (is Dropbox running?): {out_dir.parent}")
+    out_dir.mkdir(exist_ok=True)
+    manifest_path = out_dir / ".index.json"
+    used_names = {Path(m["file"]).stem: m["accession"]
+                  for m in (json.loads(manifest_path.read_text()) if manifest_path.exists() else [])}
+    return out_dir, used_names
+
+
+def run_jobs(edgar, jobs, out_dir, used_names, include_all, log):
+    """jobs: [(company, form, hits, fy_label)]. Returns (emitted rows, error messages)."""
+    emitted_all, errors = [], []
+    for company, form, hits, fy_label in jobs:
+        for r in hits:
+            log(f"\n  {company['ticker']} {form} filed {r['date']} ({r['accession']}):")
+            try:
+                emitted = intake_one(edgar, company["cik"], company["ticker"], company["legal_name"],
+                                     form, r, fy_label, out_dir, include_all, log, used_names,
+                                     company["fye"])
+            except IntakeError as e:
+                log(f"    ERROR: {e}")
+                errors.append(str(e))
+                continue
+            except urllib.error.URLError as e:  # includes HTTPError
+                why = f"HTTP {e.code} {e.url}" if isinstance(e, urllib.error.HTTPError) else f"network: {e.reason}"
+                msg = f"{company['ticker']} {form} filed {r['date']} ({r['accession']}): {why}"
+                log(f"    ERROR: {msg}")
+                errors.append(msg)
+                continue
+            emitted_all += emitted
+            if emitted:
+                log(f"    emitted {len(emitted)} file(s):")
+                for e in emitted:
+                    log(f"      {e['words']:>7} words  {e['file']}")
+    return emitted_all, errors
+
+
+def write_log(out_dir, name, lines):
+    logs = out_dir / "logs"
+    logs.mkdir(exist_ok=True)
+    (logs / name).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def report_errors(errors):
+    if errors:
+        print(f"\n{len(errors)} ERROR(S) — these filings produced nothing and are NOT in the index:",
+              file=sys.stderr)
+        for e in errors:
+            print(f"  ERROR: {e}", file=sys.stderr)
+    return 1 if errors else 0
+
+
+def intake_main(argv):
+    cfg = load_intake_config()
     ap = argparse.ArgumentParser(
         prog="sec_filings.py intake-filing",
         description="Fetch one filing (or a period's filings) and split it into per-item text "
@@ -829,80 +967,141 @@ def intake_main(argv):
     ap.add_argument("--period", required=True,
                     help="FY2020 (fiscal year, labelled by the year it ends), 2020 (calendar year), "
                          "or a date: period end for 10-K/10-Q, event date for 8-K, filing date for DEF 14A")
-    ap.add_argument("--email", help="contact email for the SEC User-Agent")
     ap.add_argument("--include-all", action="store_true", help="8-K: keep filings with no EX-99")
-    ap.add_argument("--yes", action="store_true", help="don't ask to confirm non-December fiscal years")
-    ap.add_argument("--dry-run", action="store_true", help="resolve and echo only; write nothing")
-    ap.add_argument("--refresh", action="store_true", help="re-pull filing lists instead of using raw/")
-    ap.add_argument("--out", default=cfg["intake_output_dir"],
-                    help="output folder (default: the Western Global/SEC Filings Dropbox folder)")
-    ap.add_argument("--raw", default=str(HERE / "raw"))
+    add_common_intake_args(ap, cfg)
     args = ap.parse_args(argv)
 
-    ua = f"{cfg['contact_name']} {args.email}" if args.email else \
-        os.environ.get("SEC_USER_AGENT", cfg["user_agent"])
-    edgar = CachedEdgar(ua, Path(args.raw).expanduser(), args.refresh)
-    if args.cik:
-        cik = args.cik
-    elif args.ticker.upper() in TICKER_ALIASES:
-        cik = TICKER_ALIASES[args.ticker.upper()]
-    else:
-        cik, _ = edgar.resolve(args.ticker)
-    legal_name, tickers, rows = edgar.filings(cik)
-    fye = edgar.last_submission.get("fiscalYearEnd") or "1231"
-    ticker = (args.ticker or (tickers[0] if tickers else f"CIK{cik}")).upper()
-
-    hits, fy_label = resolve_filings(rows, args.form, args.period, fye)
-    print(f"{legal_name}  CIK {cik}  ticker {ticker}  fiscal year end {fye[:2]}-{fye[2:]}")
+    edgar = open_edgar(args, cfg)
+    company = open_company(edgar, args.ticker, args.cik)
+    hits, fy_label = resolve_filings(company["rows"], args.form, args.period, company["fye"])
     if not hits:
         sys.exit(f"No {args.form} found for period {args.period}.")
-    for r in hits:
-        avail = "YES" if r["date"] <= VALUATION_DATE else "NO"
-        print(f"  {args.form:<8} period end {r['report_date'] or '-':<10}  filed {r['date']}  "
-              f"accession {r['accession']}  available at {VALUATION_DATE}: {avail}")
-    if fye != "1231" and args.form in ("10-K", "10-Q") and not args.yes and not args.dry_run:
-        if not sys.stdin.isatty():
-            sys.exit("Fiscal year does not end December 31; re-run with --yes to confirm.")
-        if input("Fiscal year does not end December 31. Proceed with the filing(s) above? [y/N] ") \
-                .strip().lower() != "y":
-            sys.exit("Stopped.")
+    echo_plan(company, args.form, hits, fy_label)
+    if args.form in ("10-K", "10-Q"):
+        confirm_fiscal_year([company], args)
     if args.dry_run:
         return 0
 
-    out_dir = Path(args.out).expanduser()
-    if not out_dir.parent.exists():
-        sys.exit(f"Output folder's parent does not exist (is Dropbox running?): {out_dir.parent}")
-    out_dir.mkdir(exist_ok=True)
+    out_dir, used_names = prepare_output(args)
     log_lines = []
 
     def log(msg):
         print(msg)
         log_lines.append(msg)
 
-    manifest_path = out_dir / ".index.json"
-    used_names = {Path(m["file"]).stem: m["accession"]
-                  for m in (json.loads(manifest_path.read_text()) if manifest_path.exists() else [])}
-    all_emitted = []
-    for r in hits:
-        log(f"\n  {args.form} filed {r['date']} ({r['accession']}):")
-        emitted = intake_one(edgar, cik, ticker, legal_name, args.form, r, fy_label, out_dir,
-                             args.include_all, log, used_names)
-        all_emitted += emitted
-        if emitted:
-            log(f"    emitted {len(emitted)} file(s):")
-            for e in emitted:
-                log(f"      {e['words']:>7} words  {e['file']}")
-    if log_lines:
-        logs = out_dir / "logs"
-        logs.mkdir(exist_ok=True)
-        (logs / f"{ticker}_{INTAKE_FORMS[args.form]}_{args.period}.log").write_text(
-            "\n".join(log_lines) + "\n", encoding="utf-8")
-    update_index(out_dir, all_emitted)
+    emitted, errors = run_jobs(edgar, [(company, args.form, hits, fy_label)], out_dir, used_names,
+                               args.include_all, log)
+    write_log(out_dir, f"{company['ticker']}_{INTAKE_FORMS[args.form]}_{args.period}.log", log_lines)
+    update_index(out_dir, emitted)
     print(f"\nIndex: {out_dir / 'filings_index.md'}")
-    return 0
+    return report_errors(errors)
+
+
+# Batch scope for the Western Global comparable set. 10-K entries are fiscal-year END dates,
+# so each company's own calendar is explicit. 10-Qs: "calendar:2020" = quarters ending in 2020;
+# "filed:A:B" = 10-Qs filed between A and B (non-December fiscal years).
+BATCH_SCOPE = {
+    "ATSG": {"10-K": ["2019-12-31", "2020-12-31"], "10-Q": "calendar:2020"},
+    "AAWW": {"10-K": ["2019-12-31", "2020-12-31"], "10-Q": "calendar:2020"},
+    "UPS":  {"10-K": ["2019-12-31", "2020-12-31"], "10-Q": "calendar:2020"},
+    "FDX":  {"10-K": ["2019-05-31", "2020-05-31"], "10-Q": "filed:2019-07-01:2021-01-31"},
+    "AIRT": {"10-K": ["2020-03-31", "2021-03-31"], "10-Q": "filed:2019-07-01:2021-01-31"},
+}
+BATCH_8K_YEAR = "2020"
+
+
+def plan_company(company, scope):
+    jobs, rows = [], company["rows"]
+    for end in scope["10-K"]:
+        hits, label = resolve_filings(rows, "10-K", end, company["fye"])
+        if not hits:
+            print(f"  10-K     MISSING: no 10-K for fiscal year ended {end}")
+        jobs.append((company, "10-K", hits, label))
+    q = scope["10-Q"]
+    if q.startswith("calendar:"):
+        hits, _ = resolve_filings(rows, "10-Q", q.split(":")[1], company["fye"])
+    else:
+        _, lo, hi = q.split(":")
+        hits = sorted((r for r in rows if r["form"] == "10-Q" and lo <= r["date"] <= hi),
+                      key=lambda r: r["report_date"])
+    jobs.append((company, "10-Q", hits, None))
+    hits, _ = resolve_filings(rows, "8-K", BATCH_8K_YEAR, company["fye"])
+    jobs.append((company, "8-K", hits, None))
+    for _, form, hits, label in jobs:
+        echo_plan(company, form, hits, label)
+    return jobs
+
+
+def batch_report(out_dir, tickers, errors):
+    manifest = json.loads((out_dir / ".index.json").read_text()) if (out_dir / ".index.json").exists() else []
+    manifest = [m for m in manifest if m["ticker"] in tickers]
+    print("\n" + "=" * 78 + "\nFINAL INDEX SUMMARY (this batch's companies)\n" + "=" * 78)
+    forms = list(INTAKE_FORMS)
+    print(f"{'Company':<8}" + "".join(f"{f:>10}" for f in forms) + f"{'YES':>8}{'NO':>8}   filings (YES/NO)")
+    zero_yes = []
+    for t in tickers:
+        mine = [m for m in manifest if m["ticker"] == t]
+        counts = "".join(f"{sum(1 for m in mine if m['form'] == f):>10}" for f in forms)
+        yes = sum(1 for m in mine if m["available"] == "YES")
+        no = len(mine) - yes
+        fy = len({m["accession"] for m in mine if m["available"] == "YES"})
+        fn = len({m["accession"] for m in mine if m["available"] == "NO"})
+        print(f"{t:<8}{counts}{yes:>8}{no:>8}   {fy}/{fn}")
+        if yes == 0:
+            zero_yes.append(t)
+    for title, flag in (("Contemporaneous record (on file by Oct 23, 2020)", "YES"),
+                        ("Post-valuation-date (hindsight/corroboration only)", "NO")):
+        rows = [m for m in manifest if m["available"] == flag]
+        filings = {}
+        for m in rows:
+            filings.setdefault((m["ticker"], m["form"], m["period"], m["filed"], m["accession"]), 0)
+            filings[(m["ticker"], m["form"], m["period"], m["filed"], m["accession"])] += 1
+        print(f"\n## {title}: {len(filings)} filings, {len(rows)} files")
+        for (t, f, per, filed, acc), n in sorted(filings.items()):
+            print(f"  {t:<5} {f:<8} {per:<12} filed {filed}  {acc}  {n:>3} files")
+    if zero_yes:
+        print(f"\nWARNING: companies with ZERO contemporaneous (YES) files: {', '.join(zero_yes)}")
+    return report_errors(errors)
+
+
+def intake_batch_main(argv):
+    cfg = load_intake_config()
+    ap = argparse.ArgumentParser(
+        prog="sec_filings.py intake-batch",
+        description="Run intake-filing over the comparable set: 10-K FY2019/FY2020 (per each "
+                    "company's fiscal calendar), 2020 10-Qs, and 2020 8-K EX-99 releases.")
+    ap.add_argument("--tickers", nargs="+", default=list(BATCH_SCOPE), choices=list(BATCH_SCOPE))
+    add_common_intake_args(ap, cfg)
+    args = ap.parse_args(argv)
+
+    edgar = open_edgar(args, cfg)
+    companies, jobs = [], []
+    print("PLAN (nothing downloaded yet except filing lists):")
+    for t in args.tickers:
+        c = open_company(edgar, t)
+        companies.append(c)
+        jobs += plan_company(c, BATCH_SCOPE[t])
+    confirm_fiscal_year(companies, args)
+    if args.dry_run:
+        return 0
+
+    out_dir, used_names = prepare_output(args)
+    log_lines = []
+
+    def log(msg):
+        print(msg)
+        log_lines.append(msg)
+
+    emitted, errors = run_jobs(edgar, jobs, out_dir, used_names, include_all=False, log=log)
+    write_log(out_dir, "batch.log", log_lines + [f"ERROR: {e}" for e in errors])
+    update_index(out_dir, emitted)  # regenerated once, at the end
+    print(f"\nIndex: {out_dir / 'filings_index.md'}")
+    return batch_report(out_dir, [c["ticker"] for c in companies], errors)
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "intake-filing":
         sys.exit(intake_main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "intake-batch":
+        sys.exit(intake_batch_main(sys.argv[2:]))
     main()
