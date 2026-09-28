@@ -44,6 +44,9 @@ DEFAULT_CONFIG = {
                   "Western Global/SEC Filings",
     "since": None,
     "until": None,
+    # intake-filing output (the raw/ download cache stays next to the script)
+    "intake_output_dir": "/Users/danamessina/KM Server Dropbox/KM Server Team Folder/Consulting/DOL/2025/"
+                         "Western Global/filings_workspace",
 }
 
 # Form type -> folder name. Amendments ("/A") map to the same folder as the base form.
@@ -831,7 +834,8 @@ def intake_main(argv):
     ap.add_argument("--yes", action="store_true", help="don't ask to confirm non-December fiscal years")
     ap.add_argument("--dry-run", action="store_true", help="resolve and echo only; write nothing")
     ap.add_argument("--refresh", action="store_true", help="re-pull filing lists instead of using raw/")
-    ap.add_argument("--out", default=str(HERE / "filings_workspace"))
+    ap.add_argument("--out", default=cfg["intake_output_dir"],
+                    help="output folder (default: filings_workspace in the Western Global Dropbox folder)")
     ap.add_argument("--raw", default=str(HERE / "raw"))
     args = ap.parse_args(argv)
 
@@ -866,7 +870,9 @@ def intake_main(argv):
         return 0
 
     out_dir = Path(args.out).expanduser()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if not out_dir.parent.exists():
+        sys.exit(f"Output folder's parent does not exist (is Dropbox running?): {out_dir.parent}")
+    out_dir.mkdir(exist_ok=True)
     log_lines = []
 
     def log(msg):
