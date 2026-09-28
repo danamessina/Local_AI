@@ -46,7 +46,7 @@ DEFAULT_CONFIG = {
     "until": None,
     # intake-filing output (the raw/ download cache stays next to the script)
     "intake_output_dir": "/Users/danamessina/KM Server Dropbox/KM Server Team Folder/Consulting/DOL/2025/"
-                         "Western Global/filings_workspace",
+                         "Western Global/SEC Filings",
 }
 
 # Form type -> folder name. Amendments ("/A") map to the same folder as the base form.
@@ -835,7 +835,7 @@ def intake_main(argv):
     ap.add_argument("--dry-run", action="store_true", help="resolve and echo only; write nothing")
     ap.add_argument("--refresh", action="store_true", help="re-pull filing lists instead of using raw/")
     ap.add_argument("--out", default=cfg["intake_output_dir"],
-                    help="output folder (default: filings_workspace in the Western Global Dropbox folder)")
+                    help="output folder (default: the Western Global/SEC Filings Dropbox folder)")
     ap.add_argument("--raw", default=str(HERE / "raw"))
     args = ap.parse_args(argv)
 
