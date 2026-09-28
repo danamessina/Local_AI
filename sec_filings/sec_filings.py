@@ -39,6 +39,7 @@ HERE = Path(__file__).resolve().parent
 # Used when config.json is absent, so the script also works as a single downloaded file.
 DEFAULT_CONFIG = {
     "user_agent": "YOUR NAME your.email@example.com",
+    "contact_name": "Dana Messina",  # SEC asks for a name and email in the User-Agent
     "output_dir": "/Users/danamessina/KM Server Dropbox/KM Server Team Folder/Consulting/DOL/2025/"
                   "Western Global/SEC Filings",
     "since": None,
@@ -174,6 +175,7 @@ class Edgar:
                     "description": p["primaryDocDescription"][i],
                 })
         rows.sort(key=lambda r: r["date"], reverse=True)
+        self.last_submission = sub
         return sub["name"], sub.get("tickers", []), rows
 
 
@@ -185,10 +187,11 @@ class _TextExtractor(html.parser.HTMLParser):
     SKIP = {"script", "style", "head", "title", "ix:header", "xbrl"}
     VOID = {"br", "hr", "img", "meta", "link", "input", "col", "area", "base", "wbr"}
 
-    def __init__(self):
+    def __init__(self, table_markers=False):
         super().__init__(convert_charrefs=True)
         self.out, self.row, self.cell = [], None, None
         self.skip_tag, self.skip_depth = None, 0
+        self.table_markers, self.table_depth = table_markers, 0
 
     def handle_starttag(self, tag, attrs):
         if self.skip_tag:
@@ -199,6 +202,10 @@ class _TextExtractor(html.parser.HTMLParser):
         if tag not in self.VOID and (tag in self.SKIP or "display:none" in style):
             self.skip_tag, self.skip_depth = tag, 1
             return
+        if tag == "table":
+            self.table_depth += 1
+            if self.table_markers and self.table_depth == 1:
+                self.out.append(f"\n{TABLE_START}\n")
         if tag == "tr":
             self.row = []
         elif tag in ("td", "th") and self.row is not None:
@@ -225,6 +232,10 @@ class _TextExtractor(html.parser.HTMLParser):
             self.row = None
         elif tag in self.BLOCK and self.cell is None:
             self.out.append("\n")
+        if tag == "table" and self.table_depth:
+            self.table_depth -= 1
+            if self.table_markers and self.table_depth == 0:
+                self.out.append(f"\n{TABLE_END}\n")
 
     def handle_data(self, data):
         if self.skip_tag:
@@ -251,12 +262,15 @@ class _TextExtractor(html.parser.HTMLParser):
         return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip() + "\n"
 
 
-def html_to_text(data):
+TABLE_START, TABLE_END = "\x01TABLE", "\x02TABLE"
+
+
+def html_to_text(data, table_markers=False):
     try:
         raw = data.decode("utf-8")
     except UnicodeDecodeError:
         raw = data.decode("cp1252", errors="replace")
-    parser = _TextExtractor()
+    parser = _TextExtractor(table_markers)
     parser.feed(raw)
     parser.close()
     return parser.text()
@@ -387,11 +401,502 @@ def main():
     out_root = Path(args.out).expanduser()
     if not args.dry_run and not out_root.parent.exists():
         sys.exit(f"Output folder's parent does not exist: {out_root.parent}")
-    edgar = Edgar(f"SEC filings research {args.email}" if args.email else cfg["user_agent"])
+    edgar = Edgar(f"{cfg['contact_name']} {args.email}" if args.email else cfg["user_agent"])
     for query, label in targets:
         download_company(edgar, query, out_root, args.since, args.until, args.all_docs, args.dry_run,
                          label, args.text)
 
 
+# ---------------------------------------------------------------------------
+# intake-filing: one filing -> per-item text files for a RAG workspace
+# ---------------------------------------------------------------------------
+
+VALUATION_DATE = "2020-10-23"
+
+# Companies taken private drop out of SEC's ticker file; map them to their CIKs.
+TICKER_ALIASES = {"ATSG": 894081, "AAWW": 1135185}
+
+INTAKE_FORMS = {"10-K": "10K", "10-Q": "10Q", "8-K": "8K", "DEF 14A": "DEF14A"}
+
+REQUIRED_ITEMS = {"10-K": ["Item1", "Item1A", "Item7", "Item8"],
+                  "10-Q": ["PartI-Item1", "PartI-Item2"]}
+
+# Item tables are extracted from these items (Item 15 only when Item 8 is a cross-reference).
+TABLE_ITEMS = {"10-K": ["Item7", "Item8"], "10-Q": ["PartI-Item1", "PartI-Item2"]}
+
+ITEM_HEADING = re.compile(
+    r"^\s*item\s*(\d{1,2}[a-c]?)\b\s*([.:\-—–|][.:\-—–|\s]*)?(.*)$", re.I)
+PART_HEADING = re.compile(r"^\s*part\s+(iv|iii|ii|i)\b\s*(?:[.:\-—–|]\s*)*(.*)$", re.I)
+# A table-of-contents row ends in a page number: "Item 7. | Management's ... | 34"
+TOC_ROW = re.compile(r"\|\s*(?:[A-Z]-)?\d{1,3}\s*$")
+
+
+class CachedEdgar(Edgar):
+    """Edgar client that keeps every response under raw/, so re-runs never refetch."""
+
+    def __init__(self, user_agent, raw_dir, refresh=False):
+        super().__init__(user_agent)
+        self.raw_dir, self.refresh = raw_dir, refresh
+
+    def _cache_path(self, url):
+        u = urllib.parse.urlparse(url)
+        path = u.path.lstrip("/") + (("__" + safe(u.query)) if u.query else "")
+        return self.raw_dir / u.netloc / path
+
+    def get(self, url):
+        dest = self._cache_path(url)
+        # Filing lists change over time; --refresh re-pulls them. Filing documents never change.
+        volatile = "/submissions/" in url or "company_tickers" in url or "browse-edgar" in url
+        if dest.exists() and not (self.refresh and volatile):
+            return dest.read_bytes()
+        data = super().get(url)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        return data
+
+
+def _date(s):
+    import datetime
+    return datetime.date.fromisoformat(s)
+
+
+def _long_date(s):
+    d = _date(s)
+    return f"{d:%B} {d.day}, {d.year}"
+
+
+def fiscal_year_bounds(fye_mmdd, fy):
+    """(start, end) of fiscal year `fy`, labelled by the calendar year in which it ends."""
+    import datetime
+    month, day = int(fye_mmdd[:2]), int(fye_mmdd[2:])
+    end = datetime.date(fy, month, min(day, 28 if month == 2 else day))
+    start = datetime.date(fy - 1, month, end.day) + datetime.timedelta(days=1)
+    return start, end
+
+
+def resolve_filings(sub_rows, form, period, fye):
+    """Pick the filing(s) for form + period. Returns (list of filing rows, period label)."""
+    import datetime
+    near = lambda a, b: abs((_date(a) - b).days) <= 10  # 52/53-week fiscal years drift a few days
+    originals = [r for r in sub_rows if r["form"] == form]
+    m_fy = re.fullmatch(r"FY(\d{4})", period, re.I)
+    m_year = re.fullmatch(r"\d{4}", period)
+    m_date = re.fullmatch(r"\d{4}-\d{2}-\d{2}", period)
+    if not (m_fy or m_year or m_date):
+        sys.exit(f"--period must be FY2020, 2020 or a date like 2020-05-31 (got {period!r})")
+
+    if form == "10-K":
+        if m_fy:
+            _, end = fiscal_year_bounds(fye, int(m_fy.group(1)))
+            label = f"FY{m_fy.group(1)}"
+        elif m_date:
+            end, label = _date(period), None
+        else:
+            _, end = fiscal_year_bounds(fye, int(period))
+            label = f"FY{period}"
+        hits = [r for r in originals if r["report_date"] and near(r["report_date"], end)]
+        hits.sort(key=lambda r: r["date"])
+        hits = hits[:1]  # the original annual report, not a later re-filing
+        if hits and not label:
+            label = f"FY{_date(hits[0]['report_date']).year}"
+        return hits, label
+
+    if form == "10-Q":
+        if m_date:
+            hits = [r for r in originals if r["report_date"] and near(r["report_date"], _date(period))]
+        else:
+            if m_fy:
+                start, end = fiscal_year_bounds(fye, int(m_fy.group(1)))
+            else:  # calendar year
+                start, end = datetime.date(int(period), 1, 1), datetime.date(int(period), 12, 31)
+            hits = [r for r in originals if r["report_date"]
+                    and start <= _date(r["report_date"]) <= end]
+        return sorted(hits, key=lambda r: r["report_date"]), None  # label per filing
+
+    if form == "8-K":
+        if m_date:
+            hits = [r for r in originals if (r["report_date"] or r["date"]) == period]
+        else:
+            year = (m_fy or m_year).group(1) if m_fy else period
+            hits = [r for r in originals if (r["report_date"] or r["date"]).startswith(year)]
+        return sorted(hits, key=lambda r: (r["report_date"] or r["date"], r["date"])), None
+
+    # DEF 14A: the proxy filed in that calendar year (or on that date)
+    if m_date:
+        hits = [r for r in originals if r["date"] == period]
+    else:
+        year = m_fy.group(1) if m_fy else period
+        hits = [r for r in originals if r["date"].startswith(year)]
+    return sorted(hits, key=lambda r: r["date"]), None
+
+
+def period_label(form, filing, fy_label):
+    if form == "10-K":
+        return fy_label
+    if form == "10-Q":
+        return filing["report_date"]
+    if form == "8-K":
+        return filing["report_date"] or filing["date"]
+    return filing["date"][:4]
+
+
+def period_phrase(form, filing, fy_label):
+    if form == "10-K":
+        return f"fiscal year ended {_long_date(filing['report_date'])}"
+    if form == "10-Q":
+        return f"quarter ended {_long_date(filing['report_date'])}"
+    if form == "8-K":
+        return f"event dated {_long_date(filing['report_date'] or filing['date'])}"
+    return f"{filing['date'][:4]} annual meeting"
+
+
+class _IndexPageParser(html.parser.HTMLParser):
+    """Read the document table on an EDGAR filing index page: (href, type) per document."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.rows, self.row, self.cell, self.href = [], None, None, None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr":
+            self.row, self.href = [], None
+        elif tag in ("td", "th") and self.row is not None:
+            self.cell = []
+        elif tag == "a" and self.row is not None:
+            self.href = self.href or dict(attrs).get("href")
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self.cell is not None:
+            self.row.append(" ".join("".join(self.cell).split()))
+            self.cell = None
+        elif tag == "tr" and self.row is not None:
+            if self.href and len(self.row) >= 4:
+                self.rows.append((self.href.split("/")[-1].split("?")[0], self.row[3]))
+            self.row = None
+
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell.append(data)
+
+
+def filing_documents(edgar, cik, filing):
+    acc = filing["accession"].replace("-", "")
+    page = edgar.get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc}/{filing['accession']}-index.htm")
+    parser = _IndexPageParser()
+    parser.feed(page.decode("utf-8", errors="replace"))
+    return parser.rows
+
+
+def split_items(text, form):
+    """Split converted filing text into items. Returns (sections, item_map_lines).
+
+    sections: list of (key, title, text); key "OtherItems" collects everything unmatched.
+    """
+    lines = text.split("\n")
+    part, cands = None, []
+    for i, line in enumerate(lines):
+        plain = line.replace("|", " ").strip()
+        mp = PART_HEADING.match(plain)
+        if mp and len(plain) < 120:
+            part = mp.group(1).upper()
+            continue
+        m = ITEM_HEADING.match(line)
+        if not m or len(line) > 200:
+            continue
+        num = m.group(1).upper()
+        # "Item 7. MD&A", "ITEM 7 - MD&A", "Item 7" alone, "Item 7 Management's..." are headings;
+        # "Item 1A of this report discusses ..." is a sentence.
+        if not m.group(2) and m.group(3) and not m.group(3)[0].isupper():
+            continue
+        title = m.group(3).replace("|", " ").strip()
+        if not title:  # heading split across lines: take the next nonblank line as the title
+            nxt = next((l for l in lines[i + 1:i + 4]
+                        if l.strip() and l not in (TABLE_START, TABLE_END)), "")
+            title = nxt.replace("|", " ").strip() if len(nxt) < 150 else ""
+        title = TOC_ROW.sub("", title).strip(" .")
+        key = (f"Part{part}-Item{num}" if form == "10-Q" and part else f"Item{num}")
+        cands.append({"line": i, "key": key, "title": title,
+                      "toc": bool(TOC_ROW.search(line))})
+
+    # Measure each candidate's span to the next one; the table of contents and stray
+    # cross-references give tiny spans, the real heading the longest.
+    real = [c for c in cands if not c["toc"]]
+    for j, c in enumerate(real):
+        end = real[j + 1]["line"] if j + 1 < len(real) else len(lines)
+        c["words"] = len(" ".join(lines[c["line"]:end]).split())
+    best = {}
+    for c in real:
+        if c["key"] not in best or c["words"] > best[c["key"]]["words"]:
+            best[c["key"]] = c
+    kept = sorted(best.values(), key=lambda c: c["line"])
+    for j, c in enumerate(kept):  # report the spans actually emitted
+        end = kept[j + 1]["line"] if j + 1 < len(kept) else len(lines)
+        c["words"] = len(strip_markers("\n".join(lines[c["line"]:end])).split())
+
+    for c in kept:  # a heading laid out as a table: start the section at the table itself
+        k = c["line"] - 1
+        while k >= 0 and not lines[k].strip():
+            k -= 1
+        if k >= 0 and lines[k] == TABLE_START:
+            c["line"] = k
+    sections, other = [], []
+    first = kept[0]["line"] if kept else len(lines)
+    other.append("\n".join(lines[:first]))
+    for j, c in enumerate(kept):
+        end = kept[j + 1]["line"] if j + 1 < len(kept) else len(lines)
+        sections.append((c["key"], c["title"], "\n".join(lines[c["line"]:end])))
+    # Anything after the signatures / exhibit index stays with the last item; nothing is dropped.
+    sections.append(("OtherItems", "Cover page, table of contents and unmatched text", "\n".join(other)))
+
+    item_map = [f"  {'line':>6}  {'key':<16} {'words':>7}  title"]
+    for c in kept:
+        item_map.append(f"  {c['line']:>6}  {c['key']:<16} {c['words']:>7}  {c['title'][:70]}")
+    skipped = [c for c in cands if c not in kept]
+    if skipped:
+        item_map.append(f"  ({len(skipped)} other heading match(es) treated as table of contents / "
+                        f"cross-references, kept in surrounding text)")
+    return sections, item_map
+
+
+def extract_tables(section_text):
+    """Return [(caption, rows_text)] for each table with 2+ rows and some numbers."""
+    tables, lines, i = [], section_text.split("\n"), 0
+    while i < len(lines):
+        if lines[i] == TABLE_START:
+            j = i + 1
+            while j < len(lines) and lines[j] not in (TABLE_END, TABLE_START):
+                j += 1
+            rows = [l for l in lines[i + 1:j] if l.strip()]
+            closed = j < len(lines) and lines[j] == TABLE_END
+            if closed and len(rows) >= 2 and any(re.search(r"\d", r) for r in rows):
+                caption = ""
+                for k in range(i - 1, max(i - 15, -1), -1):
+                    l = lines[k].strip()
+                    if l and l not in (TABLE_START, TABLE_END) and "|" not in l:
+                        caption = l[:200]
+                        break
+                tables.append((caption or "(no caption)", "\n".join(rows)))
+            i = j + 1 if closed else j
+        else:
+            i += 1
+    return tables
+
+
+def strip_markers(text):
+    t = "\n".join(l for l in text.split("\n") if l not in (TABLE_START, TABLE_END))
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
+def tag_footer(ticker, form, period, item_label, filed, legal_name, phrase, accession, cite_item,
+               available):
+    return (f"\n\n--matter FILINGS --author {ticker} --type \"{form} {period} {item_label}\" "
+            f"--date {filed[:4]}\n"
+            f"--cite \"{legal_name}, Form {form} for {phrase}, filed {filed}, "
+            f"EDGAR accession {accession}, {cite_item}\"\n"
+            f"Available at {VALUATION_DATE}: {'YES' if available else 'NO'}\n"
+            f"Source: EDGAR (digital text, no OCR)\n")
+
+
+def item_cite(key, title):
+    label = key.replace("PartI-", "Part I, ").replace("PartII-", "Part II, ") \
+               .replace("Item", "Item ")
+    return f"{label} ({title})" if title and key != "OtherItems" else (
+        "cover page / unmatched text" if key == "OtherItems" else label)
+
+
+def write_emitted(path, body, footer, emitted, meta):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = body.strip() or "(no text in this section)"  # a file must never begin with the tag block
+    path.write_text(body + footer, encoding="utf-8")
+    emitted.append({**meta, "file": path.name, "words": len(body.split())})
+
+
+def update_index(out_dir, accession_rows):
+    """Merge this run's rows into the manifest and regenerate filings_index.md."""
+    manifest_path = out_dir / ".index.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else []
+    replaced = {r["accession"] for r in accession_rows}
+    manifest = [r for r in manifest if r["accession"] not in replaced] + accession_rows
+    manifest.sort(key=lambda r: (r["ticker"], r["filed"], r["file"]))
+    manifest_path.write_text(json.dumps(manifest, indent=1))
+
+    def table(rows):
+        out = ["| Company | Form | Period | Item / table | Filed | Accession | Available at "
+               f"{VALUATION_DATE} | File |", "|---|---|---|---|---|---|---|---|"]
+        out += [f"| {r['ticker']} | {r['form']} | {r['period']} | {r['part']} | {r['filed']} | "
+                f"{r['accession']} | {r['available']} | {r['file']} |" for r in rows]
+        return out if rows else ["_(none)_"]
+
+    yes = [r for r in manifest if r["available"] == "YES"]
+    no = [r for r in manifest if r["available"] == "NO"]
+    md = ["# Public filings index", "",
+          f"Valuation date: {VALUATION_DATE}. Availability is the EDGAR filing date on or before "
+          "that date. Regenerated on every intake-filing run.", "",
+          f"## Contemporaneous record (on file by Oct 23, 2020) — {len(yes)} files", ""] + table(yes) + [
+          "", f"## Post-valuation-date (hindsight/corroboration only) — {len(no)} files", ""] + table(no)
+    (out_dir / "filings_index.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    return manifest
+
+
+def intake_one(edgar, cik, ticker, legal_name, form, filing, fy_label, out_dir, include_all, log,
+               used_names):
+    acc_path = filing["accession"].replace("-", "")
+    base = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_path}"
+    period = period_label(form, filing, fy_label)
+    phrase = period_phrase(form, filing, fy_label)
+    available = filing["date"] <= VALUATION_DATE
+    stem = f"FILINGS_{ticker}_{INTAKE_FORMS[form]}-{period}"
+    emitted = []
+    common = {"ticker": ticker, "form": form, "period": period, "filed": filing["date"],
+              "accession": filing["accession"], "available": "YES" if available else "NO"}
+
+    def footer(item_label, cite):
+        return tag_footer(ticker, form, period, item_label, filing["date"], legal_name, phrase,
+                          filing["accession"], cite, available)
+
+    if form == "8-K":
+        docs = filing_documents(edgar, cik, filing)
+        ex99 = [(d, t) for d, t in docs if re.match(r"EX-99", t, re.I)]
+        if not ex99:
+            if not include_all:
+                log(f"    skip: no EX-99 exhibit (use --include-all to keep)")
+                return []
+            ex99 = [(filing["primary_doc"], "8-K")]
+        for doc, typ in ex99:
+            tag = re.sub(r"^EX-", "EX", typ.upper()).replace(".", "-") if typ != "8-K" else "Main"
+            name, n = f"{stem}_{tag}", 2
+            # Two 8-Ks with the same event date, or two exhibits of the same type, get _2, _3 ...
+            while used_names.get(name, filing["accession"]) != filing["accession"] or \
+                    name in used_names.get(("this", filing["accession"]), set()):
+                name, n = f"{stem}_{tag}_{n}", n + 1
+            used_names[name] = filing["accession"]
+            used_names.setdefault(("this", filing["accession"]), set()).add(name)
+            text = strip_markers(html_to_text(edgar.get(f"{base}/{doc}")))
+            cite = f"Exhibit {typ.replace('EX-', '')}" if typ != "8-K" else "Form 8-K"
+            write_emitted(out_dir / f"{name}.txt", text, footer(tag, cite), emitted,
+                          {**common, "part": tag})
+        return emitted
+
+    text = html_to_text(edgar.get(f"{base}/{filing['primary_doc']}"), table_markers=True)
+    if form == "DEF 14A":
+        write_emitted(out_dir / f"{stem}_Full.txt", strip_markers(text),
+                      footer("Full", "Definitive Proxy Statement"), emitted, {**common, "part": "Full"})
+        return emitted
+
+    sections, item_map = split_items(text, form)
+    log(f"    item map ({filing['primary_doc']}):")
+    for line in item_map:
+        log(line)
+    keys = [k for k, _, _ in sections]
+    for req in REQUIRED_ITEMS[form]:
+        if req not in keys:
+            log(f"    WARNING: required {req} not detected; its text is in another item or OtherItems")
+
+    table_items = list(TABLE_ITEMS[form])
+    item8 = next((t for k, _, t in sections if k == "Item8"), "")
+    if form == "10-K" and len(item8.split()) < 150 and "Item15" in keys:
+        log("    NOTE: Item 8 is short (likely a cross-reference); also extracting Item 15 tables")
+        table_items.append("Item15")
+
+    for key, title, body in sections:
+        write_emitted(out_dir / f"{stem}_{key}.txt", strip_markers(body),
+                      footer(key, item_cite(key, title)), emitted, {**common, "part": key})
+        if key in table_items:
+            for n, (caption, rows) in enumerate(extract_tables(body), 1):
+                tkey = f"{key}_T{n:02d}"
+                write_emitted(out_dir / f"{stem}_{tkey}.txt", f"{caption}\n{rows}",
+                              footer(tkey, f"{item_cite(key, title)}, table: {caption}"), emitted,
+                              {**common, "part": tkey})
+    return emitted
+
+
+def intake_main(argv):
+    cfg = dict(DEFAULT_CONFIG)
+    for f in ("config.json", "config.local.json"):
+        if (HERE / f).exists():
+            cfg.update(json.loads((HERE / f).read_text()))
+    ap = argparse.ArgumentParser(
+        prog="sec_filings.py intake-filing",
+        description="Fetch one filing (or a period's filings) and split it into per-item text "
+                    "files with end-of-file tags for a RAG workspace.")
+    who = ap.add_mutually_exclusive_group(required=True)
+    who.add_argument("--ticker")
+    who.add_argument("--cik", type=int)
+    ap.add_argument("--form", required=True, choices=list(INTAKE_FORMS))
+    ap.add_argument("--period", required=True,
+                    help="FY2020 (fiscal year, labelled by the year it ends), 2020 (calendar year), "
+                         "or a date: period end for 10-K/10-Q, event date for 8-K, filing date for DEF 14A")
+    ap.add_argument("--email", help="contact email for the SEC User-Agent")
+    ap.add_argument("--include-all", action="store_true", help="8-K: keep filings with no EX-99")
+    ap.add_argument("--yes", action="store_true", help="don't ask to confirm non-December fiscal years")
+    ap.add_argument("--dry-run", action="store_true", help="resolve and echo only; write nothing")
+    ap.add_argument("--refresh", action="store_true", help="re-pull filing lists instead of using raw/")
+    ap.add_argument("--out", default=str(HERE / "filings_workspace"))
+    ap.add_argument("--raw", default=str(HERE / "raw"))
+    args = ap.parse_args(argv)
+
+    ua = f"{cfg['contact_name']} {args.email}" if args.email else \
+        os.environ.get("SEC_USER_AGENT", cfg["user_agent"])
+    edgar = CachedEdgar(ua, Path(args.raw).expanduser(), args.refresh)
+    if args.cik:
+        cik = args.cik
+    elif args.ticker.upper() in TICKER_ALIASES:
+        cik = TICKER_ALIASES[args.ticker.upper()]
+    else:
+        cik, _ = edgar.resolve(args.ticker)
+    legal_name, tickers, rows = edgar.filings(cik)
+    fye = edgar.last_submission.get("fiscalYearEnd") or "1231"
+    ticker = (args.ticker or (tickers[0] if tickers else f"CIK{cik}")).upper()
+
+    hits, fy_label = resolve_filings(rows, args.form, args.period, fye)
+    print(f"{legal_name}  CIK {cik}  ticker {ticker}  fiscal year end {fye[:2]}-{fye[2:]}")
+    if not hits:
+        sys.exit(f"No {args.form} found for period {args.period}.")
+    for r in hits:
+        avail = "YES" if r["date"] <= VALUATION_DATE else "NO"
+        print(f"  {args.form:<8} period end {r['report_date'] or '-':<10}  filed {r['date']}  "
+              f"accession {r['accession']}  available at {VALUATION_DATE}: {avail}")
+    if fye != "1231" and args.form in ("10-K", "10-Q") and not args.yes and not args.dry_run:
+        if not sys.stdin.isatty():
+            sys.exit("Fiscal year does not end December 31; re-run with --yes to confirm.")
+        if input("Fiscal year does not end December 31. Proceed with the filing(s) above? [y/N] ") \
+                .strip().lower() != "y":
+            sys.exit("Stopped.")
+    if args.dry_run:
+        return 0
+
+    out_dir = Path(args.out).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_lines = []
+
+    def log(msg):
+        print(msg)
+        log_lines.append(msg)
+
+    manifest_path = out_dir / ".index.json"
+    used_names = {Path(m["file"]).stem: m["accession"]
+                  for m in (json.loads(manifest_path.read_text()) if manifest_path.exists() else [])}
+    all_emitted = []
+    for r in hits:
+        log(f"\n  {args.form} filed {r['date']} ({r['accession']}):")
+        emitted = intake_one(edgar, cik, ticker, legal_name, args.form, r, fy_label, out_dir,
+                             args.include_all, log, used_names)
+        all_emitted += emitted
+        if emitted:
+            log(f"    emitted {len(emitted)} file(s):")
+            for e in emitted:
+                log(f"      {e['words']:>7} words  {e['file']}")
+    if log_lines:
+        logs = out_dir / "logs"
+        logs.mkdir(exist_ok=True)
+        (logs / f"{ticker}_{INTAKE_FORMS[args.form]}_{args.period}.log").write_text(
+            "\n".join(log_lines) + "\n", encoding="utf-8")
+    update_index(out_dir, all_emitted)
+    print(f"\nIndex: {out_dir / 'filings_index.md'}")
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "intake-filing":
+        sys.exit(intake_main(sys.argv[2:]))
     main()
